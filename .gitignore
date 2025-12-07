@@ -1,2 +1,5 @@
 venv
 .env
+ffmpeg.exe
+ffplay.exe
+ffprobe.exe
