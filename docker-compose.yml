@@ -1,0 +1,9 @@
+version: "3.9"
+
+services:
+  walesh_music:
+    build: .
+    container_name: walesh_music
+    restart: unless-stopped
+    env_file:
+      - ./.env
