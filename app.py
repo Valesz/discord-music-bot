@@ -211,8 +211,6 @@ class MusicPlayer:
         self.guild_id = guild_id
         self.queue: deque[YTDLSource] = deque()
         self.current: Optional[YTDLSource] = None
-        self.loop_song: bool = False
-        self.loop_queue: bool = False
         self.volume: float = 0.5
         self.text_channel_id: Optional[int] = None
         logger.info(f"Created MusicPlayer for guild {guild_id}")
@@ -223,11 +221,6 @@ class MusicPlayer:
 
     def next(self) -> Optional[YTDLSource]:
         """Get next track. Note: doesn't perform cleanup here."""
-        if self.loop_song and self.current:
-            return self.current
-        if self.loop_queue and self.current:
-            # requeue current at the end
-            self.queue.append(self.current)
         return self.queue.popleft() if self.queue else None
 
     async def clear_queue(self):
@@ -300,14 +293,6 @@ class MusicControls(discord.ui.View):
             await interaction.response.send_message("⏹ Stopped and cleared queue.", ephemeral=True)
         else:
             await interaction.response.send_message("Not connected.", ephemeral=True)
-
-    @discord.ui.button(label="🔁 Toggle Loop", style=discord.ButtonStyle.secondary)
-    async def toggle_loop(self, interaction: Interaction, button: discord.ui.Button):
-        player = get_player(interaction.guild.id)
-        player.loop_song = not player.loop_song
-        if player.loop_song:
-            player.loop_queue = False
-        await interaction.response.send_message(f"🔁 Loop song set to **{player.loop_song}**", ephemeral=True)
 
 # ---------------------- AUTOCOMPLETE HELPER ----------------------
 async def yt_autocomplete(current: str) -> List[app_commands.Choice[str]]:
@@ -585,22 +570,6 @@ async def volume_cmd(interaction: Interaction, percent: int):
     if player.current:
         player.current.volume = player.volume
     await interaction.response.send_message(f"🔊 Volume set to **{percent}%**", ephemeral=True)
-
-@tree.command(name="loop", description="Toggle looping of current song")
-async def loop_cmd(interaction: Interaction):
-    player = get_player(interaction.guild_id)
-    player.loop_song = not player.loop_song
-    if player.loop_song:
-        player.loop_queue = False
-    await interaction.response.send_message(f"🔁 Loop song: **{player.loop_song}**", ephemeral=True)
-
-@tree.command(name="loopqueue", description="Toggle looping of the queue")
-async def loopqueue_cmd(interaction: Interaction):
-    player = get_player(interaction.guild_id)
-    player.loop_queue = not player.loop_queue
-    if player.loop_queue:
-        player.loop_song = False
-    await interaction.response.send_message(f"🔁 Loop queue: **{player.loop_queue}**", ephemeral=True)
 
 @tree.command(name="now", description="Show now playing")
 async def now_cmd(interaction: Interaction):
