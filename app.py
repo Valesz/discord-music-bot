@@ -478,7 +478,8 @@ async def join(interaction: Interaction):
         return await interaction.response.send_message("You must be in a voice channel.", ephemeral=True)
     channel = interaction.user.voice.channel
     await channel.connect()
-    await interaction.response.send_message("Joined your voice channel ✅", ephemeral=True)
+    view = MusicControls(interaction.guild_id)
+    await interaction.response.send_message("Joined your voice channel ✅", view=view)
 
 @tree.command(name="leave", description="Disconnect bot from voice channel")
 async def leave(interaction: Interaction):
@@ -555,7 +556,8 @@ async def skip(interaction: Interaction):
     vc = interaction.guild.voice_client
     if vc and (vc.is_playing() or vc.is_paused()):
         vc.stop()
-        await interaction.response.send_message("⏭ Skipped", ephemeral=True)
+        view = MusicControls(interaction.guild_id)
+        await interaction.response.send_message("⏭ Skipped", view=view)
     else:
         await interaction.response.send_message("Nothing to skip.", ephemeral=True)
 
@@ -564,7 +566,8 @@ async def pause(interaction: Interaction):
     vc = interaction.guild.voice_client
     if vc and vc.is_playing():
         vc.pause()
-        await interaction.response.send_message("⏸ Paused", ephemeral=True)
+        view = MusicControls(interaction.guild_id)
+        await interaction.response.send_message("⏸ Paused", view=view)
     else:
         await interaction.response.send_message("Nothing is playing.", ephemeral=True)
 
@@ -573,7 +576,8 @@ async def resume(interaction: Interaction):
     vc = interaction.guild.voice_client
     if vc and vc.is_paused():
         vc.resume()
-        await interaction.response.send_message("▶️ Resumed", ephemeral=True)
+        view = MusicControls(interaction.guild_id)
+        await interaction.response.send_message("▶️ Resumed", view=view)
     else:
         await interaction.response.send_message("Nothing to resume.", ephemeral=True)
 
@@ -620,7 +624,8 @@ async def show_queue(interaction: Interaction):
                 break
         embed.add_field(name="Up Next", value=desc, inline=False)
     
-    await interaction.response.send_message(embed=embed)
+    view = MusicControls(interaction.guild_id)
+    await interaction.response.send_message(embed=embed, view=view)
 
 @tree.command(name="volume", description="Set playback volume (0-100)")
 @app_commands.describe(percent="Volume percent 0-100")
@@ -631,7 +636,8 @@ async def volume_cmd(interaction: Interaction, percent: int):
     player.volume = percent / 100
     if player.current:
         player.current.volume = player.volume
-    await interaction.response.send_message(f"🔊 Volume set to **{percent}%**", ephemeral=True)
+    view = MusicControls(interaction.guild_id)
+    await interaction.response.send_message(f"🔊 Volume set to **{percent}%**", view=view)
 
 @tree.command(name="now", description="Show now playing")
 async def now_cmd(interaction: Interaction):
@@ -653,7 +659,8 @@ async def now_cmd(interaction: Interaction):
         embed.add_field(name="Status", value=status, inline=True)
         embed.add_field(name="Volume", value=f"{int(player.volume * 100)}%", inline=True)
         
-        await interaction.response.send_message(embed=embed)
+        view = MusicControls(interaction.guild_id)
+        await interaction.response.send_message(embed=embed, view=view)
     else:
         await interaction.response.send_message("Nothing is playing.", ephemeral=True)
 
