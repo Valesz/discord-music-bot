@@ -14,6 +14,7 @@ from pathlib import Path
 import logging
 from logging.handlers import RotatingFileHandler
 from typing import Optional, Dict, List
+from datetime import datetime, timedelta
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -108,7 +109,9 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.title = data.get("title")
         self.uploader = data.get("uploader")
         self.webpage_url = data.get("webpage_url")
+        self.duration = data.get("duration", 0)  # duration in seconds
         self.filepath = filepath  # local file path if downloaded; None when streaming
+        self.start_time: Optional[float] = None  # timestamp when playback started
         logger.debug = logger.debug  # keep linter happy
 
     @classmethod
@@ -245,6 +248,43 @@ def get_player(guild_id: int) -> MusicPlayer:
         players[guild_id] = MusicPlayer(guild_id)
     return players[guild_id]
 
+# ---------------------- PROGRESS BAR HELPER ----------------------
+def format_time(seconds: int) -> str:
+    """Format seconds into MM:SS or HH:MM:SS format using timedelta."""
+    if seconds < 0:
+        seconds = 0
+    td = timedelta(seconds=seconds)
+    total_seconds = int(td.total_seconds())
+    hours = total_seconds // 3600
+    minutes = (total_seconds % 3600) // 60
+    secs = total_seconds % 60
+    
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+def create_progress_bar(current: int, total: int, length: int = 20) -> str:
+    """Create an ASCII progress bar."""
+    if total <= 0:
+        return f"`[{'─' * length}]` {format_time(current)} / LIVE"
+    
+    progress = min(current / total, 1.0)
+    filled = int(length * progress)
+    bar = '━' * filled + '─' * (length - filled)
+    
+    return f"`[{bar}]` {format_time(current)} / {format_time(total)}"
+
+def get_current_playback_time(player: MusicPlayer, voice_client) -> int:
+    """Calculate current playback position in seconds using datetime."""
+    if not player.current or not player.current.start_time:
+        return 0
+    
+    # Calculate elapsed time using datetime
+    now = datetime.now()
+    start = datetime.fromtimestamp(player.current.start_time)
+    elapsed = (now - start).total_seconds()
+    return int(elapsed)
+
 # ---------------------- BUTTONS UI ----------------------
 class MusicControls(discord.ui.View):
     def __init__(self, guild_id: int):
@@ -350,6 +390,7 @@ async def _play_next_for_guild(guild_id: int):
     # set current to next and play
     player.current = next_source
     player.current.volume = player.volume
+    player.current.start_time = datetime.now().timestamp()  # Record start time as timestamp
     logger.info(f"[Guild {guild_id}] Now playing: {player.current.title}")
 
     def _after_play(error):
@@ -479,6 +520,7 @@ async def play(interaction: Interaction, query: str):
 
     if not vc.is_playing() and not vc.is_paused() and player.current is None:
         player.current = source
+        player.current.start_time = datetime.now().timestamp()  # Record start time as timestamp
 
         def _after_play(err):
             if err:
@@ -549,15 +591,35 @@ async def stop(interaction: Interaction):
 @tree.command(name="queue", description="Show current queue")
 async def show_queue(interaction: Interaction):
     player = get_player(interaction.guild_id)
-    if not player.queue:
-        return await interaction.response.send_message("Queue is empty.", ephemeral=True)
+    vc = interaction.guild.voice_client
+    
     embed = discord.Embed(title="Queue", color=0x2F3136)
-    desc = ""
-    for i, item in enumerate(player.queue, start=1):
-        desc += f"`{i}.` {item.title}\n"
-        if len(desc) > 1900:
-            break
-    embed.description = desc
+    
+    # Show currently playing with progress bar
+    if player.current:
+        current_time = get_current_playback_time(player, vc)
+        progress = create_progress_bar(current_time, player.current.duration)
+        embed.add_field(
+            name="🎵 Now Playing",
+            value=f"**{player.current.title}**\n{progress}",
+            inline=False
+        )
+    
+    # Show queue
+    if not player.queue:
+        if not player.current:
+            return await interaction.response.send_message("Queue is empty.", ephemeral=True)
+        embed.add_field(name="Up Next", value="*Queue is empty*", inline=False)
+    else:
+        desc = ""
+        for i, item in enumerate(player.queue, start=1):
+            duration_str = format_time(item.duration) if item.duration else "Unknown"
+            desc += f"`{i}.` {item.title} `[{duration_str}]`\n"
+            if len(desc) > 1800:
+                desc += "... and more"
+                break
+        embed.add_field(name="Up Next", value=desc, inline=False)
+    
     await interaction.response.send_message(embed=embed)
 
 @tree.command(name="volume", description="Set playback volume (0-100)")
@@ -574,10 +636,23 @@ async def volume_cmd(interaction: Interaction, percent: int):
 @tree.command(name="now", description="Show now playing")
 async def now_cmd(interaction: Interaction):
     player = get_player(interaction.guild_id)
+    vc = interaction.guild.voice_client
+    
     if player.current:
+        current_time = get_current_playback_time(player, vc)
+        progress = create_progress_bar(current_time, player.current.duration)
+        
         embed = discord.Embed(title="Now Playing", description=f"**{player.current.title}**", color=0x1DB954)
+        embed.add_field(name="Progress", value=progress, inline=False)
+        
         if player.current.uploader:
             embed.set_footer(text=f"From {player.current.uploader}")
+        
+        # Add playback status
+        status = "⏸ Paused" if vc and vc.is_paused() else "▶️ Playing"
+        embed.add_field(name="Status", value=status, inline=True)
+        embed.add_field(name="Volume", value=f"{int(player.volume * 100)}%", inline=True)
+        
         await interaction.response.send_message(embed=embed)
     else:
         await interaction.response.send_message("Nothing is playing.", ephemeral=True)
