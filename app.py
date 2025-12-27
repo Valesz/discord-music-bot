@@ -87,7 +87,10 @@ ytdl_format_options = {
     "noplaylist": False,  # MÓDOSÍTVA: engedélyezzük a lejátszási listákat
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
-    "extract_flat": False,  # teljes információ kinyerése
+    "extract_flat": "in_playlist",  # KRITIKUS: ne töltse le a teljes playlist infót, csak a video ID-kat
+    "ignoreerrors": True,  # folytassa hibák esetén
+    "no_color": True,
+    "cookiefile": None,  # opcionálisan add hozzá a cookie fájlt ha van
 }
 
 ffmpeg_options = {"options": "-vn"}
@@ -154,14 +157,21 @@ class YTDLSource(discord.PCMVolumeTransformer):
         """
         Lejátszási lista információk kinyerése letöltés nélkül.
         Visszaadja a lejátszási lista címét és a videók listáját.
+        Ez a módszer FLAT extraction-t használ, hogy elkerülje a copyright hibákat.
         """
         loop = loop or asyncio.get_event_loop()
         logger.info(f"Extracting playlist info for: {url}")
 
         def extract():
             try:
-                # Ne töltsük le, csak szerezzük meg az infót
-                return ytdl.extract_info(url, download=False)
+                # Flat extraction: csak a video ID-kat szerezzük meg, ne a teljes metaadatokat
+                # Ez elkerüli a copyright/restriction hibákat a playlist szintjén
+                opts = ytdl_format_options.copy()
+                opts['extract_flat'] = 'in_playlist'  # csak alapvető infó
+                opts['ignoreerrors'] = True  # hibák esetén folytassa
+                
+                temp_ytdl = youtube_dl.YoutubeDL(opts)
+                return temp_ytdl.extract_info(url, download=False)
             except Exception as e:
                 logger.error(f"Playlist extraction error for {url}: {e}")
                 return None
@@ -171,11 +181,35 @@ class YTDLSource(discord.PCMVolumeTransformer):
             raise RuntimeError("Failed to extract playlist data")
 
         # Ellenőrizzük, hogy valóban lejátszási lista-e
-        if data.get("_type") != "playlist" or "entries" not in data:
-            raise RuntimeError("URL is not a playlist")
+        if data.get("_type") != "playlist":
+            # Ha nem playlist, akkor lehet egy video URL list= paraméterrel
+            # Próbáljuk meg egyedi videóként kezelni
+            if "entries" not in data:
+                raise RuntimeError("URL is not a playlist")
+        
+        if "entries" not in data:
+            raise RuntimeError("Playlist has no entries")
 
         playlist_title = data.get("title", "Unknown Playlist")
-        entries = [entry for entry in data["entries"] if entry]  # Szűrjük a None értékeket
+        
+        # Szűrjük a None és üres értékeket, és alakítsuk át megfelelő formátumra
+        entries = []
+        for entry in data["entries"]:
+            if entry and entry.get("id"):
+                # Ha flat extraction van, akkor csak az ID-t kapjuk
+                # Építsük fel a teljes URL-t
+                video_id = entry.get("id")
+                entry_url = entry.get("url") or entry.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"
+                
+                # Készítsünk egy egyszerű entry objektumot
+                simple_entry = {
+                    "id": video_id,
+                    "url": entry_url,
+                    "webpage_url": entry_url,
+                    "title": entry.get("title", f"Video {video_id}"),
+                    "duration": entry.get("duration"),
+                }
+                entries.append(simple_entry)
         
         logger.info(f"Playlist '{playlist_title}' contains {len(entries)} videos")
         return playlist_title, entries
@@ -507,6 +541,130 @@ async def leave(interaction: Interaction):
     else:
         await interaction.response.send_message("Bot is not connected.", ephemeral=True)
 
+def is_video_available(entry: dict) -> tuple[bool, Optional[str]]:
+    """
+    Check if a video is available for playback.
+    Returns (is_available, reason_if_not)
+    """
+    if not entry:
+        return False, "Invalid entry"
+    
+    # Check if video is unavailable
+    if entry.get("unavailable", False):
+        return False, "Video unavailable"
+    
+    # Check if video is private
+    if entry.get("is_private", False):
+        return False, "Private video"
+    
+    # Check for age restriction
+    if entry.get("age_limit", 0) > 0:
+        # We can still try to play age-restricted videos
+        pass
+    
+    # Check for geo-restriction
+    availability = entry.get("availability")
+    if availability and availability not in ["public", "unlisted", None]:
+        return False, f"Restricted ({availability})"
+    
+    # Check for explicit restriction messages
+    if "This video is unavailable" in str(entry.get("title", "")):
+        return False, "Video unavailable"
+    
+    # Check if removed or deleted
+    if entry.get("removed", False) or entry.get("deleted", False):
+        return False, "Video removed or deleted"
+    
+    # Check live status (optional: skip live streams if desired)
+    # is_live = entry.get("is_live", False)
+    # if is_live:
+    #     return False, "Live stream"
+    
+    return True, None
+
+async def safe_extract_video(video_url: str, loop: Optional[asyncio.AbstractEventLoop] = None) -> Optional[YTDLSource]:
+    """
+    Safely extract and create a YTDLSource, with proper error handling for restricted content.
+    Returns None if video cannot be played.
+    """
+    loop = loop or asyncio.get_event_loop()
+    
+    def extract_and_download():
+        try:
+            # Direktben letöltünk és ellenőrzünk
+            # Ha bármilyen hiba van, yt-dlp automatikusan elkapja
+            opts = ytdl_format_options.copy()
+            opts['extract_flat'] = False  # teljes infó kell a lejátszáshoz
+            opts['noplaylist'] = True  # biztosan csak egy videó
+            opts['ignoreerrors'] = False  # itt már nem ignoráljuk a hibákat
+            
+            temp_ytdl = youtube_dl.YoutubeDL(opts)
+            info = temp_ytdl.extract_info(video_url, download=True)
+            
+            if not info:
+                return None, "Failed to extract info"
+            
+            # Ha keresési eredmény lenne (nem kellene lennie)
+            if "entries" in info:
+                info = info["entries"][0]
+            
+            return info, None
+            
+        except youtube_dl.utils.DownloadError as e:
+            error_msg = str(e).lower()
+            if "copyright" in error_msg:
+                return None, "Copyright restriction"
+            elif "not available" in error_msg or "unavailable" in error_msg:
+                return None, "Video unavailable"
+            elif "private" in error_msg:
+                return None, "Private video"
+            elif "deleted" in error_msg or "removed" in error_msg:
+                return None, "Video removed"
+            elif "country" in error_msg or "geo" in error_msg or "location" in error_msg:
+                return None, "Geographic restriction"
+            elif "age" in error_msg:
+                return None, "Age restriction"
+            elif "premieres" in error_msg:
+                return None, "Video premiere (not yet available)"
+            elif "members" in error_msg or "member" in error_msg:
+                return None, "Members-only content"
+            else:
+                logger.warning(f"Download error for {video_url}: {str(e)[:100]}")
+                return None, "Cannot download"
+        except youtube_dl.utils.ExtractorError as e:
+            error_msg = str(e).lower()
+            if "private" in error_msg:
+                return None, "Private video"
+            elif "unavailable" in error_msg:
+                return None, "Video unavailable"
+            else:
+                logger.warning(f"Extractor error for {video_url}: {str(e)[:100]}")
+                return None, "Extraction failed"
+        except Exception as e:
+            logger.warning(f"Unexpected error for {video_url}: {str(e)[:100]}")
+            return None, "Unexpected error"
+    
+    # Próbáljuk meg letölteni
+    info, error_reason = await loop.run_in_executor(None, extract_and_download)
+    
+    if info is None:
+        logger.info(f"Skipping video {video_url}: {error_reason}")
+        return None
+    
+    # Most készítsük el a forrást a letöltött fájlból
+    try:
+        filepath = ytdl.prepare_filename(info)
+        if not Path(filepath).exists():
+            logger.error(f"Downloaded file not found: {filepath}")
+            return None
+        
+        audio_source = discord.FFmpegPCMAudio(filepath, executable="ffmpeg", **ffmpeg_options)
+        source = YTDLSource(audio_source, data=info, filepath=filepath)
+        return source
+    except Exception as e:
+        logger.error(f"Error creating audio source for {video_url}: {e}")
+        return None
+
 @tree.command(name="play", description="Play a song or playlist from a URL or search terms")
 @app_commands.describe(query="YouTube URL, playlist URL, or search keywords")
 async def play(interaction: Interaction, query: str):
@@ -533,24 +691,40 @@ async def play(interaction: Interaction, query: str):
             
             # Limitáljuk a lejátszási listát (pl. max 50 dal)
             MAX_PLAYLIST_SIZE = 50
-            if len(entries) > MAX_PLAYLIST_SIZE:
+            total_videos = len(entries)
+            if total_videos > MAX_PLAYLIST_SIZE:
                 await interaction.followup.send(
-                    f"⚠️ Playlist contains {len(entries)} videos. Only the first {MAX_PLAYLIST_SIZE} will be added.",
+                    f"⚠️ Playlist contains {total_videos} videos. Only the first {MAX_PLAYLIST_SIZE} will be processed.",
                     ephemeral=True
                 )
                 entries = entries[:MAX_PLAYLIST_SIZE]
             
             # Első dal lejátszása vagy sorba állítása
             added_count = 0
+            skipped_count = 0
             first_song = True
+            skipped_reasons = {}
             
-            for entry in entries:
+            for i, entry in enumerate(entries, 1):
                 try:
-                    # Videó URL készítése
-                    video_url = entry.get("webpage_url") or f"https://youtube.com/watch?v={entry.get('id')}"
+                    # Videó URL készítése a flat extraction eredményéből
+                    video_url = entry.get("url") or entry.get("webpage_url")
                     
-                    # Forrás létrehozása
-                    source = await YTDLSource.from_url(video_url, loop=bot.loop, download=True)
+                    if not video_url:
+                        logger.warning(f"No URL for entry {i}, skipping")
+                        skipped_count += 1
+                        skipped_reasons["No URL"] = skipped_reasons.get("No URL", 0) + 1
+                        continue
+                    
+                    # Biztonságos forrás létrehozása (ez most letölt és ellenőriz)
+                    # A safe_extract_video már kezeli az összes lehetséges hibát
+                    source = await safe_extract_video(video_url, loop=bot.loop)
+                    
+                    if source is None:
+                        skipped_count += 1
+                        skipped_reasons["Restricted or unavailable"] = skipped_reasons.get("Restricted or unavailable", 0) + 1
+                        continue
+                    
                     source.volume = player.volume
                     
                     # Első dal kezelése
@@ -585,23 +759,35 @@ async def play(interaction: Interaction, query: str):
                         player.add(source)
                     
                     added_count += 1
+                    logger.info(f"Added song {i}/{len(entries)} from playlist: {source.title}")
                     
                 except Exception as e:
-                    logger.error(f"Error adding song from playlist: {e}")
+                    logger.error(f"Error adding song {i}/{len(entries)} from playlist: {e}")
+                    skipped_count += 1
+                    skipped_reasons["Error"] = skipped_reasons.get("Error", 0) + 1
                     continue
             
-            # Összefoglaló üzenet
-            if added_count > 1:
-                await interaction.followup.send(
-                    f"✅ Added **{added_count}** songs from playlist **{playlist_title}**",
-                    ephemeral=True
-                )
-            elif added_count == 0:
+            # Részletes összefoglaló üzenet
+            if added_count > 0:
+                summary = f"✅ Added **{added_count}** songs from playlist **{playlist_title}**"
+                if skipped_count > 0:
+                    summary += f"\n⚠️ Skipped **{skipped_count}** unavailable videos"
+                    if skipped_reasons:
+                        reasons_text = ", ".join([f"{count} {reason}" for reason, count in skipped_reasons.items()])
+                        summary += f"\n_Reasons: {reasons_text}_"
+                await interaction.followup.send(summary, ephemeral=True)
+            elif skipped_count > 0:
+                summary = f"❌ Could not add any songs from the playlist.\n⚠️ All **{skipped_count}** videos were unavailable or restricted."
+                if skipped_reasons:
+                    reasons_text = "\n".join([f"• {reason}: {count}" for reason, count in skipped_reasons.items()])
+                    summary += f"\n\n**Reasons:**\n{reasons_text}"
+                await interaction.followup.send(summary, ephemeral=True)
+            else:
                 await interaction.followup.send("❌ Could not add any songs from the playlist.", ephemeral=True)
                 
         except Exception as e:
             logger.error(f"[Guild {interaction.guild_id}] Playlist error for '{query}': {e}")
-            return await interaction.followup.send(f"❌ Could not load playlist. Error: {e.__class__}", ephemeral=True)
+            return await interaction.followup.send("❌ Could not load playlist.", ephemeral=True)
     
     else:
         # Egyedi dal lejátszása (eredeti logika)
