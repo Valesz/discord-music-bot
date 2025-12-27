@@ -1,5 +1,5 @@
 # bot.py
-# Slash-only Discord music bot with buttons UI, auto-leave, safe download cleanup, autocomplete, logging
+# Slash-only Discord music bot with buttons UI, auto-leave, safe download cleanup, autocomplete, logging, PLAYLIST SUPPORT
 
 import discord
 from discord.ext import commands, tasks
@@ -58,7 +58,7 @@ intents.voice_states = True
 intents.guilds = True
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)  # prefix not used but required by commands.Bot
+bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
 # ---------------------- UTILS ----------------------
@@ -70,13 +70,10 @@ def safe_create_task(coro: asyncio.coroutines) -> asyncio.Task:
     try:
         return bot.loop.create_task(coro)
     except Exception:
-        # Fallback: try getting a running loop (rare case)
         try:
             loop = asyncio.get_event_loop()
             return loop.create_task(coro)
         except Exception:
-            # As last resort, run it in a new loop in a background thread (shouldn't be necessary)
-            # but we prefer explicit error rather than silently swallowing.
             raise RuntimeError("Unable to schedule coroutine; no event loop available")
 
 # ---------------------- YTDL / FFMPEG ----------------------
@@ -87,9 +84,13 @@ ytdl_format_options = {
     "no_warnings": True,
     "geo_bypass": True,
     "nocheckcertificate": True,
-    "noplaylist": True,
+    "noplaylist": False,  # MÓDOSÍTVA: engedélyezzük a lejátszási listákat
     "default_search": "ytsearch",
     "source_address": "0.0.0.0",
+    "extract_flat": "in_playlist",  # KRITIKUS: ne töltse le a teljes playlist infót, csak a video ID-kat
+    "ignoreerrors": True,  # folytassa hibák esetén
+    "no_color": True,
+    "cookiefile": None,  # opcionálisan add hozzá a cookie fájlt ha van
 }
 
 ffmpeg_options = {"options": "-vn"}
@@ -97,9 +98,14 @@ ffmpeg_options = {"options": "-vn"}
 ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
 
 URL_RE = re.compile(r'^(https?://)?(www\.)?(youtube\.com|youtu\.be|spotify\.com|soundcloud\.com)')
+PLAYLIST_RE = re.compile(r'(youtube\.com/playlist\?|youtube\.com/watch\?.*&list=|youtu\.be/.*\?list=)')
 
 def is_url(s: str) -> bool:
     return bool(URL_RE.match(s))
+
+def is_playlist_url(s: str) -> bool:
+    """Ellenőrzi, hogy a megadott URL lejátszási lista-e"""
+    return bool(PLAYLIST_RE.search(s))
 
 # ---------------------- YTDL SOURCE (with safe cleanup) ----------------------
 class YTDLSource(discord.PCMVolumeTransformer):
@@ -109,10 +115,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.title = data.get("title")
         self.uploader = data.get("uploader")
         self.webpage_url = data.get("webpage_url")
-        self.duration = data.get("duration", 0)  # duration in seconds
-        self.filepath = filepath  # local file path if downloaded; None when streaming
-        self.start_time: Optional[float] = None  # timestamp when playback started
-        logger.debug = logger.debug  # keep linter happy
+        self.duration = data.get("duration", 0)
+        self.filepath = filepath
+        self.start_time: Optional[float] = None
+        logger.debug = logger.debug
 
     @classmethod
     async def from_url(cls, query: str, *, loop: Optional[asyncio.AbstractEventLoop] = None, download: bool = True):
@@ -131,8 +137,8 @@ class YTDLSource(discord.PCMVolumeTransformer):
         if data is None:
             raise RuntimeError("yt-dlp failed to extract data")
 
-        # If it's a search or playlist, take the first entry
-        if "entries" in data:
+        # Ha keresési eredmény, vedd az első találatot
+        if "entries" in data and not data.get("_type") == "playlist":
             data = data["entries"][0]
 
         filepath = None
@@ -141,25 +147,82 @@ class YTDLSource(discord.PCMVolumeTransformer):
             logger.info(f"Downloaded to: {filepath}")
             audio_source = discord.FFmpegPCMAudio(filepath, executable="ffmpeg", **ffmpeg_options)
         else:
-            # streaming (direct url)
             source_url = data.get("url")
             audio_source = discord.FFmpegPCMAudio(source_url, executable="ffmpeg", **ffmpeg_options)
 
         return cls(audio_source, data=data, filepath=filepath)
 
+    @classmethod
+    async def extract_playlist_info(cls, url: str, *, loop: Optional[asyncio.AbstractEventLoop] = None):
+        """
+        Lejátszási lista információk kinyerése letöltés nélkül.
+        Visszaadja a lejátszási lista címét és a videók listáját.
+        Ez a módszer FLAT extraction-t használ, hogy elkerülje a copyright hibákat.
+        """
+        loop = loop or asyncio.get_event_loop()
+        logger.info(f"Extracting playlist info for: {url}")
+
+        def extract():
+            try:
+                # Flat extraction: csak a video ID-kat szerezzük meg, ne a teljes metaadatokat
+                # Ez elkerüli a copyright/restriction hibákat a playlist szintjén
+                opts = ytdl_format_options.copy()
+                opts['extract_flat'] = 'in_playlist'  # csak alapvető infó
+                opts['ignoreerrors'] = True  # hibák esetén folytassa
+                
+                temp_ytdl = youtube_dl.YoutubeDL(opts)
+                return temp_ytdl.extract_info(url, download=False)
+            except Exception as e:
+                logger.error(f"Playlist extraction error for {url}: {e}")
+                return None
+
+        data = await loop.run_in_executor(None, extract)
+        if data is None:
+            raise RuntimeError("Failed to extract playlist data")
+
+        # Ellenőrizzük, hogy valóban lejátszási lista-e
+        if data.get("_type") != "playlist":
+            # Ha nem playlist, akkor lehet egy video URL list= paraméterrel
+            # Próbáljuk meg egyedi videóként kezelni
+            if "entries" not in data:
+                raise RuntimeError("URL is not a playlist")
+        
+        if "entries" not in data:
+            raise RuntimeError("Playlist has no entries")
+
+        playlist_title = data.get("title", "Unknown Playlist")
+        
+        # Szűrjük a None és üres értékeket, és alakítsuk át megfelelő formátumra
+        entries = []
+        for entry in data["entries"]:
+            if entry and entry.get("id"):
+                # Ha flat extraction van, akkor csak az ID-t kapjuk
+                # Építsük fel a teljes URL-t
+                video_id = entry.get("id")
+                entry_url = entry.get("url") or entry.get("webpage_url") or f"https://www.youtube.com/watch?v={video_id}"
+                
+                # Készítsünk egy egyszerű entry objektumot
+                simple_entry = {
+                    "id": video_id,
+                    "url": entry_url,
+                    "webpage_url": entry_url,
+                    "title": entry.get("title", f"Video {video_id}"),
+                    "duration": entry.get("duration"),
+                }
+                entries.append(simple_entry)
+        
+        logger.info(f"Playlist '{playlist_title}' contains {len(entries)} videos")
+        return playlist_title, entries
+
     def _close_ffmpeg_process(self):
         """Attempt to cleanly close FFmpeg process / pipes used by discord.FFmpegPCMAudio."""
         try:
-            # discord.FFmpegPCMAudio has a cleanup() method
             if hasattr(self, "cleanup"):
-                # If this instance is itself a wrapped AudioSource, call its cleanup
                 try:
                     self.cleanup()
                 except Exception:
-                    # attribute may belong to inner source
                     pass
 
-            # The wrapped AudioSource object is accessible via ._source in some wrappers; handle common cases:
             wrapped = getattr(self, "_source", None)
             if wrapped:
                 if hasattr(wrapped, "cleanup"):
@@ -167,7 +230,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
                         wrapped.cleanup()
                     except Exception:
                         pass
-                # kill process if accessible
                 proc = getattr(wrapped, "process", None) or getattr(wrapped, "_process", None)
                 if proc:
                     try:
@@ -175,7 +237,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
                     except Exception:
                         pass
 
-            # also try to find process attribute on self
             proc2 = getattr(self, "process", None) or getattr(self, "_process", None)
             if proc2:
                 try:
@@ -188,12 +249,10 @@ class YTDLSource(discord.PCMVolumeTransformer):
     async def async_cleanup(self, *, wait: float = 0.2):
         """Async-safe cleanup: close ffmpeg handles, wait a bit, then delete the downloaded file if present."""
         try:
-            # Close/kill ffmpeg resources first
             self._close_ffmpeg_process()
         except Exception as e:
             logger.debug(f"Error closing ffmpeg process: {e}")
 
-        # small delay to ensure OS releases the file handle (important on Windows)
         try:
             await asyncio.sleep(wait)
         except Exception:
@@ -216,6 +275,8 @@ class MusicPlayer:
         self.current: Optional[YTDLSource] = None
         self.volume: float = 0.5
         self.text_channel_id: Optional[int] = None
+        self.is_loading_playlist: bool = False  # NEW: flag to track playlist loading
+        self.stop_loading: bool = False  # NEW: flag to signal stop
         logger.info(f"Created MusicPlayer for guild {guild_id}")
 
     def add(self, source: YTDLSource):
@@ -229,17 +290,19 @@ class MusicPlayer:
     async def clear_queue(self):
         """Clear queue and schedule async cleanup for all queued items and current."""
         logger.info(f"[Guild {self.guild_id}] Clearing queue ({len(self.queue)} items)")
+        self.stop_loading = True  # NEW: signal to stop any ongoing playlist loading
         tasks = []
         while self.queue:
             item = self.queue.popleft()
-            # we're inside an async function, so it's fine to create_task here
             tasks.append(asyncio.create_task(item.async_cleanup()))
-        # cleanup current if any
         if self.current:
             tasks.append(asyncio.create_task(self.current.async_cleanup()))
             self.current = None
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        # Reset the flag after a short delay
+        await asyncio.sleep(0.5)
+        self.stop_loading = False
 
 players: Dict[int, MusicPlayer] = {}
 
@@ -279,7 +342,6 @@ def get_current_playback_time(player: MusicPlayer, voice_client) -> int:
     if not player.current or not player.current.start_time:
         return 0
     
-    # Calculate elapsed time using datetime
     now = datetime.now()
     start = datetime.fromtimestamp(player.current.start_time)
     elapsed = (now - start).total_seconds()
@@ -306,9 +368,15 @@ class MusicControls(discord.ui.View):
     @discord.ui.button(label="▶️ Resume", style=discord.ButtonStyle.green)
     async def resume(self, interaction: Interaction, button: discord.ui.Button):
         vc = await self._get_vc(interaction)
+        player = get_player(interaction.guild.id)
+        
         if vc and vc.is_paused():
             vc.resume()
             await interaction.response.send_message("▶️ Resumed", ephemeral=True)
+        elif vc and not vc.is_playing() and len(player.queue) > 0:
+            # Special case: nothing playing but queue has songs
+            await interaction.response.send_message("▶️ Starting playback from queue...", ephemeral=True)
+            await _play_next_for_guild(interaction.guild.id)
         else:
             await interaction.response.send_message("Nothing to resume.", ephemeral=True)
 
@@ -370,9 +438,8 @@ async def _play_next_for_guild(guild_id: int):
     if player.text_channel_id:
         text_channel = bot.get_channel(player.text_channel_id)
 
-    # pick next track
     next_source = player.next()
-    prev = player.current  # hold previous to cleanup later
+    prev = player.current
     if next_source is None:
         player.current = None
         logger.info(f"[Guild {guild_id}] Queue ended")
@@ -381,22 +448,18 @@ async def _play_next_for_guild(guild_id: int):
                 await text_channel.send("Queue ended.")
             except Exception:
                 pass
-        # cleanup previous if existed
         if prev:
-            # schedule previous cleanup on bot loop
             safe_create_task(prev.async_cleanup())
         return
 
-    # set current to next and play
     player.current = next_source
     player.current.volume = player.volume
-    player.current.start_time = datetime.now().timestamp()  # Record start time as timestamp
+    player.current.start_time = datetime.now().timestamp()
     logger.info(f"[Guild {guild_id}] Now playing: {player.current.title}")
 
     def _after_play(error):
         if error:
             logger.error(f"[Guild {guild_id}] Playback error: {error}")
-        # schedule cleanup of prev and advance to next
         if prev:
             safe_create_task(prev.async_cleanup())
         fut = asyncio.run_coroutine_threadsafe(_play_next_for_guild(guild_id), bot.loop)
@@ -413,12 +476,10 @@ async def _play_next_for_guild(guild_id: int):
         vc.play(player.current, after=_after_play)
     except Exception as e:
         logger.error(f"[Guild {guild_id}] Error calling vc.play: {e}")
-        # schedule cleanup of prev if present
         if prev:
             safe_create_task(prev.async_cleanup())
         return
 
-    # announce
     if text_channel:
         try:
             view = MusicControls(guild_id)
@@ -457,7 +518,7 @@ async def cleanup_orphaned_files():
                 if not file.is_file():
                     continue
                 age = now - file.stat().st_mtime
-                if age > 1300:  # older than 1 hour
+                if age > 3600:
                     try:
                         file.unlink()
                         removed += 1
@@ -492,8 +553,132 @@ async def leave(interaction: Interaction):
     else:
         await interaction.response.send_message("Bot is not connected.", ephemeral=True)
 
-@tree.command(name="play", description="Play a song from a URL or search terms")
-@app_commands.describe(query="YouTube URL or search keywords")
+def is_video_available(entry: dict) -> tuple[bool, Optional[str]]:
+    """
+    Check if a video is available for playback.
+    Returns (is_available, reason_if_not)
+    """
+    if not entry:
+        return False, "Invalid entry"
+    
+    # Check if video is unavailable
+    if entry.get("unavailable", False):
+        return False, "Video unavailable"
+    
+    # Check if video is private
+    if entry.get("is_private", False):
+        return False, "Private video"
+    
+    # Check for age restriction
+    if entry.get("age_limit", 0) > 0:
+        # We can still try to play age-restricted videos
+        pass
+    
+    # Check for geo-restriction
+    availability = entry.get("availability")
+    if availability and availability not in ["public", "unlisted", None]:
+        return False, f"Restricted ({availability})"
+    
+    # Check for explicit restriction messages
+    if "This video is unavailable" in str(entry.get("title", "")):
+        return False, "Video unavailable"
+    
+    # Check if removed or deleted
+    if entry.get("removed", False) or entry.get("deleted", False):
+        return False, "Video removed or deleted"
+    
+    # Check live status (optional: skip live streams if desired)
+    # is_live = entry.get("is_live", False)
+    # if is_live:
+    #     return False, "Live stream"
+    
+    return True, None
+
+async def safe_extract_video(video_url: str, loop: Optional[asyncio.AbstractEventLoop] = None) -> Optional[YTDLSource]:
+    """
+    Safely extract and create a YTDLSource, with proper error handling for restricted content.
+    Returns None if video cannot be played.
+    """
+    loop = loop or asyncio.get_event_loop()
+    
+    def extract_and_download():
+        try:
+            # Direktben letöltünk és ellenőrzünk
+            # Ha bármilyen hiba van, yt-dlp automatikusan elkapja
+            opts = ytdl_format_options.copy()
+            opts['extract_flat'] = False  # teljes infó kell a lejátszáshoz
+            opts['noplaylist'] = True  # biztosan csak egy videó
+            opts['ignoreerrors'] = False  # itt már nem ignoráljuk a hibákat
+            
+            temp_ytdl = youtube_dl.YoutubeDL(opts)
+            info = temp_ytdl.extract_info(video_url, download=True)
+            
+            if not info:
+                return None, "Failed to extract info"
+            
+            # Ha keresési eredmény lenne (nem kellene lennie)
+            if "entries" in info:
+                info = info["entries"][0]
+            
+            return info, None
+            
+        except youtube_dl.utils.DownloadError as e:
+            error_msg = str(e).lower()
+            if "copyright" in error_msg:
+                return None, "Copyright restriction"
+            elif "not available" in error_msg or "unavailable" in error_msg:
+                return None, "Video unavailable"
+            elif "private" in error_msg:
+                return None, "Private video"
+            elif "deleted" in error_msg or "removed" in error_msg:
+                return None, "Video removed"
+            elif "country" in error_msg or "geo" in error_msg or "location" in error_msg:
+                return None, "Geographic restriction"
+            elif "age" in error_msg:
+                return None, "Age restriction"
+            elif "premieres" in error_msg:
+                return None, "Video premiere (not yet available)"
+            elif "members" in error_msg or "member" in error_msg:
+                return None, "Members-only content"
+            else:
+                logger.warning(f"Download error for {video_url}: {str(e)[:100]}")
+                return None, "Cannot download"
+        except youtube_dl.utils.ExtractorError as e:
+            error_msg = str(e).lower()
+            if "private" in error_msg:
+                return None, "Private video"
+            elif "unavailable" in error_msg:
+                return None, "Video unavailable"
+            else:
+                logger.warning(f"Extractor error for {video_url}: {str(e)[:100]}")
+                return None, "Extraction failed"
+        except Exception as e:
+            logger.warning(f"Unexpected error for {video_url}: {str(e)[:100]}")
+            return None, "Unexpected error"
+    
+    # Próbáljuk meg letölteni
+    info, error_reason = await loop.run_in_executor(None, extract_and_download)
+    
+    if info is None:
+        logger.info(f"Skipping video {video_url}: {error_reason}")
+        return None
+    
+    # Most készítsük el a forrást a letöltött fájlból
+    try:
+        filepath = ytdl.prepare_filename(info)
+        if not Path(filepath).exists():
+            logger.error(f"Downloaded file not found: {filepath}")
+            return None
+        
+        audio_source = discord.FFmpegPCMAudio(filepath, executable="ffmpeg", **ffmpeg_options)
+        source = YTDLSource(audio_source, data=info, filepath=filepath)
+        return source
+    except Exception as e:
+        logger.error(f"Error creating audio source for {video_url}: {e}")
+        return None
+
+@tree.command(name="play", description="Play a song or playlist from a URL or search terms")
+@app_commands.describe(query="YouTube URL, playlist URL, or search keywords")
 async def play(interaction: Interaction, query: str):
     if interaction.user.voice is None:
         return await interaction.response.send_message("You must be in a voice channel.", ephemeral=True)
@@ -505,51 +690,179 @@ async def play(interaction: Interaction, query: str):
     player = get_player(interaction.guild_id)
     player.text_channel_id = interaction.channel_id
 
-    await interaction.response.send_message("🔎 Loading (this can take a few seconds)...", ephemeral=True)
-
-    # Build extract query (autocomplete may send a video URL)
-    extract_query = query if is_url(query) else f"ytsearch1:{query}"
-
-    try:
-        # We download to local file so we can safely cleanup after playing
-        source = await YTDLSource.from_url(extract_query, loop=bot.loop, download=True)
-    except Exception as e:
-        logger.error(f"[Guild {interaction.guild_id}] Play extraction error for '{query}': {e}")
-        return await interaction.followup.send("❌ Could not find or play that song.", ephemeral=True)
-
-    source.volume = player.volume
-
-    if not vc.is_playing() and not vc.is_paused() and player.current is None:
-        player.current = source
-        player.current.start_time = datetime.now().timestamp()  # Record start time as timestamp
-
-        def _after_play(err):
-            if err:
-                logger.error(f"[Guild {interaction.guild_id}] Playback error: {err}")
-            # schedule next track safely
-            fut = asyncio.run_coroutine_threadsafe(_play_next_for_guild(interaction.guild_id), bot.loop)
-            try:
-                fut.result()
-            except Exception as exc:
-                logger.error(f"Error scheduling next after initial play: {exc}")
+    # Ellenőrizzük, hogy lejátszási lista URL-e
+    if is_url(query) and is_playlist_url(query):
+        await interaction.response.send_message("🔎 Loading playlist (this may take a moment)...", ephemeral=True)
+        
+        # Set loading flag
+        player.is_loading_playlist = True
+        player.stop_loading = False
+        
+        try:
+            # Szerezzük meg a lejátszási lista információit
+            playlist_title, entries = await YTDLSource.extract_playlist_info(query, loop=bot.loop)
+            
+            if not entries:
+                player.is_loading_playlist = False
+                return await interaction.followup.send("❌ Playlist is empty or unavailable.", ephemeral=True)
+            
+            # Limitáljuk a lejátszási listát (pl. max 50 dal)
+            MAX_PLAYLIST_SIZE = 50
+            total_videos = len(entries)
+            if total_videos > MAX_PLAYLIST_SIZE:
+                await interaction.followup.send(
+                    f"⚠️ Playlist contains {total_videos} videos. Only the first {MAX_PLAYLIST_SIZE} will be processed.",
+                    ephemeral=True
+                )
+                entries = entries[:MAX_PLAYLIST_SIZE]
+            
+            # Első dal lejátszása vagy sorba állítása
+            added_count = 0
+            skipped_count = 0
+            first_song = True
+            skipped_reasons = {}
+            
+            for i, entry in enumerate(entries, 1):
+                # CHECK: Ha a stop flag be van állítva, állítsuk le a playlist betöltését
+                if player.stop_loading:
+                    logger.info(f"[Guild {interaction.guild_id}] Playlist loading stopped by user at {i}/{len(entries)}")
+                    await interaction.followup.send(
+                        f"⏹ Playlist loading stopped. Added **{added_count}** songs before stopping.",
+                        ephemeral=True
+                    )
+                    player.is_loading_playlist = False
+                    return
+                
+                try:
+                    # Videó URL készítése a flat extraction eredményéből
+                    video_url = entry.get("url") or entry.get("webpage_url")
+                    
+                    if not video_url:
+                        logger.warning(f"No URL for entry {i}, skipping")
+                        skipped_count += 1
+                        skipped_reasons["No URL"] = skipped_reasons.get("No URL", 0) + 1
+                        continue
+                    
+                    # Biztonságos forrás létrehozása (ez most letölt és ellenőriz)
+                    # A safe_extract_video már kezeli az összes lehetséges hibát
+                    source = await safe_extract_video(video_url, loop=bot.loop)
+                    
+                    if source is None:
+                        skipped_count += 1
+                        skipped_reasons["Restricted or unavailable"] = skipped_reasons.get("Restricted or unavailable", 0) + 1
+                        continue
+                    
+                    source.volume = player.volume
+                    
+                    # Első dal kezelése
+                    if first_song and not vc.is_playing() and not vc.is_paused() and player.current is None:
+                        player.current = source
+                        player.current.start_time = datetime.now().timestamp()
+                        
+                        def _after_play(err):
+                            if err:
+                                logger.error(f"[Guild {interaction.guild_id}] Playback error: {err}")
+                            fut = asyncio.run_coroutine_threadsafe(_play_next_for_guild(interaction.guild_id), bot.loop)
+                            try:
+                                fut.result()
+                            except Exception as exc:
+                                logger.error(f"Error scheduling next after initial play: {exc}")
+                        
+                        vc.play(source, after=_after_play)
+                        first_song = False
+                        
+                        # "Now Playing" üzenet
+                        view = MusicControls(interaction.guild_id)
+                        embed = discord.Embed(
+                            title="Now Playing",
+                            description=f"**{source.title}**\n\n📋 From playlist: *{playlist_title}*",
+                            color=0x1DB954
+                        )
+                        if source.uploader:
+                            embed.set_footer(text=f"From {source.uploader}")
+                        await interaction.followup.send(embed=embed, view=view)
+                    else:
+                        # Sorba állítás
+                        player.add(source)
+                    
+                    added_count += 1
+                    logger.info(f"Added song {i}/{len(entries)} from playlist: {source.title}")
+                    
+                except Exception as e:
+                    logger.error(f"Error adding song {i}/{len(entries)} from playlist: {e}")
+                    skipped_count += 1
+                    skipped_reasons["Error"] = skipped_reasons.get("Error", 0) + 1
+                    continue
+            
+            # Reset loading flag
+            player.is_loading_playlist = False
+            
+            # Részletes összefoglaló üzenet
+            if added_count > 0:
+                summary = f"✅ Added **{added_count}** songs from playlist **{playlist_title}**"
+                if skipped_count > 0:
+                    summary += f"\n⚠️ Skipped **{skipped_count}** unavailable videos"
+                    if skipped_reasons:
+                        reasons_text = ", ".join([f"{count} {reason}" for reason, count in skipped_reasons.items()])
+                        summary += f"\n_Reasons: {reasons_text}_"
+                await interaction.followup.send(summary, ephemeral=True)
+            elif skipped_count > 0:
+                summary = f"❌ Could not add any songs from the playlist.\n⚠️ All **{skipped_count}** videos were unavailable or restricted."
+                if skipped_reasons:
+                    reasons_text = "\n".join([f"• {reason}: {count}" for reason, count in skipped_reasons.items()])
+                    summary += f"\n\n**Reasons:**\n{reasons_text}"
+                await interaction.followup.send(summary, ephemeral=True)
+            else:
+                await interaction.followup.send("❌ Could not add any songs from the playlist.", ephemeral=True)
+                
+        except Exception as e:
+            player.is_loading_playlist = False
+            logger.error(f"[Guild {interaction.guild_id}] Playlist error for '{query}': {e}")
+            return await interaction.followup.send("❌ Could not load playlist.", ephemeral=True)
+    
+    else:
+        # Egyedi dal lejátszása (eredeti logika)
+        await interaction.response.send_message("🔎 Loading (this can take a few seconds)...", ephemeral=True)
+        
+        extract_query = query if is_url(query) else f"ytsearch1:{query}"
 
         try:
-            vc.play(source, after=_after_play)
+            source = await YTDLSource.from_url(extract_query, loop=bot.loop, download=True)
         except Exception as e:
-            logger.error(f"Error starting playback: {e}")
-            await interaction.followup.send("❌ Failed to play audio.", ephemeral=True)
-            # cleanup the source file since we couldn't play it
-            await source.async_cleanup()
-            return
+            logger.error(f"[Guild {interaction.guild_id}] Play extraction error for '{query}': {e}")
+            return await interaction.followup.send("❌ Could not find or play that song.", ephemeral=True)
 
-        view = MusicControls(interaction.guild_id)
-        embed = discord.Embed(title="Now Playing", description=f"**{source.title}**", color=0x1DB954)
-        if source.uploader:
-            embed.set_footer(text=f"From {source.uploader}")
-        await interaction.followup.send(embed=embed, view=view)
-    else:
-        player.add(source)
-        await interaction.followup.send(f"➕ Queued **{source.title}**", ephemeral=True)
+        source.volume = player.volume
+
+        if not vc.is_playing() and not vc.is_paused() and player.current is None:
+            player.current = source
+            player.current.start_time = datetime.now().timestamp()
+
+            def _after_play(err):
+                if err:
+                    logger.error(f"[Guild {interaction.guild_id}] Playback error: {err}")
+                fut = asyncio.run_coroutine_threadsafe(_play_next_for_guild(interaction.guild_id), bot.loop)
+                try:
+                    fut.result()
+                except Exception as exc:
+                    logger.error(f"Error scheduling next after initial play: {exc}")
+
+            try:
+                vc.play(source, after=_after_play)
+            except Exception as e:
+                logger.error(f"Error starting playback: {e}")
+                await interaction.followup.send("❌ Failed to play audio.", ephemeral=True)
+                await source.async_cleanup()
+                return
+
+            view = MusicControls(interaction.guild_id)
+            embed = discord.Embed(title="Now Playing", description=f"**{source.title}**", color=0x1DB954)
+            if source.uploader:
+                embed.set_footer(text=f"From {source.uploader}")
+            await interaction.followup.send(embed=embed, view=view)
+        else:
+            player.add(source)
+            await interaction.followup.send(f"➕ Queued **{source.title}**", ephemeral=True)
 
 @tree.command(name="skip", description="Skip current track")
 async def skip(interaction: Interaction):
@@ -574,10 +887,22 @@ async def pause(interaction: Interaction):
 @tree.command(name="resume", description="Resume playback")
 async def resume(interaction: Interaction):
     vc = interaction.guild.voice_client
+    player = get_player(interaction.guild_id)
+    
     if vc and vc.is_paused():
         vc.resume()
         view = MusicControls(interaction.guild_id)
         await interaction.response.send_message("▶️ Resumed", view=view)
+    elif vc and not vc.is_playing() and len(player.queue) > 0:
+        # Special case: nothing playing but queue has songs
+        # This happens when user skips before next song loads
+        logger.info(f"[Guild {interaction.guild_id}] Resume triggered with empty current but non-empty queue")
+        await interaction.response.send_message("▶️ Starting playback from queue...", ephemeral=True)
+        await _play_next_for_guild(interaction.guild_id)
+    elif not vc:
+        await interaction.response.send_message("Bot is not connected to a voice channel.", ephemeral=True)
+    elif len(player.queue) == 0 and player.current is None:
+        await interaction.response.send_message("Nothing to resume. Queue is empty.", ephemeral=True)
     else:
         await interaction.response.send_message("Nothing to resume.", ephemeral=True)
 
@@ -599,7 +924,6 @@ async def show_queue(interaction: Interaction):
     
     embed = discord.Embed(title="Queue", color=0x2F3136)
     
-    # Show currently playing with progress bar
     if player.current:
         current_time = get_current_playback_time(player, vc)
         progress = create_progress_bar(current_time, player.current.duration)
@@ -609,7 +933,6 @@ async def show_queue(interaction: Interaction):
             inline=False
         )
     
-    # Show queue
     if not player.queue:
         if not player.current:
             return await interaction.response.send_message("Queue is empty.", ephemeral=True)
@@ -619,7 +942,7 @@ async def show_queue(interaction: Interaction):
         for i, item in enumerate(player.queue, start=1):
             duration_str = format_time(item.duration) if item.duration else "Unknown"
             desc += f"`{i}.` {item.title} `[{duration_str}]`\n"
-            if len(desc) > 1800:
+            if len(desc) > 950:
                 desc += "... and more"
                 break
         embed.add_field(name="Up Next", value=desc, inline=False)
@@ -654,7 +977,6 @@ async def now_cmd(interaction: Interaction):
         if player.current.uploader:
             embed.set_footer(text=f"From {player.current.uploader}")
         
-        # Add playback status
         status = "⏸ Paused" if vc and vc.is_paused() else "▶️ Playing"
         embed.add_field(name="Status", value=status, inline=True)
         embed.add_field(name="Volume", value=f"{int(player.volume * 100)}%", inline=True)
