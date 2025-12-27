@@ -275,6 +275,8 @@ class MusicPlayer:
         self.current: Optional[YTDLSource] = None
         self.volume: float = 0.5
         self.text_channel_id: Optional[int] = None
+        self.is_loading_playlist: bool = False  # NEW: flag to track playlist loading
+        self.stop_loading: bool = False  # NEW: flag to signal stop
         logger.info(f"Created MusicPlayer for guild {guild_id}")
 
     def add(self, source: YTDLSource):
@@ -288,6 +290,7 @@ class MusicPlayer:
     async def clear_queue(self):
         """Clear queue and schedule async cleanup for all queued items and current."""
         logger.info(f"[Guild {self.guild_id}] Clearing queue ({len(self.queue)} items)")
+        self.stop_loading = True  # NEW: signal to stop any ongoing playlist loading
         tasks = []
         while self.queue:
             item = self.queue.popleft()
@@ -297,6 +300,9 @@ class MusicPlayer:
             self.current = None
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        # Reset the flag after a short delay
+        await asyncio.sleep(0.5)
+        self.stop_loading = False
 
 players: Dict[int, MusicPlayer] = {}
 
@@ -362,9 +368,15 @@ class MusicControls(discord.ui.View):
     @discord.ui.button(label="▶️ Resume", style=discord.ButtonStyle.green)
     async def resume(self, interaction: Interaction, button: discord.ui.Button):
         vc = await self._get_vc(interaction)
+        player = get_player(interaction.guild.id)
+        
         if vc and vc.is_paused():
             vc.resume()
             await interaction.response.send_message("▶️ Resumed", ephemeral=True)
+        elif vc and not vc.is_playing() and len(player.queue) > 0:
+            # Special case: nothing playing but queue has songs
+            await interaction.response.send_message("▶️ Starting playback from queue...", ephemeral=True)
+            await _play_next_for_guild(interaction.guild.id)
         else:
             await interaction.response.send_message("Nothing to resume.", ephemeral=True)
 
@@ -682,11 +694,16 @@ async def play(interaction: Interaction, query: str):
     if is_url(query) and is_playlist_url(query):
         await interaction.response.send_message("🔎 Loading playlist (this may take a moment)...", ephemeral=True)
         
+        # Set loading flag
+        player.is_loading_playlist = True
+        player.stop_loading = False
+        
         try:
             # Szerezzük meg a lejátszási lista információit
             playlist_title, entries = await YTDLSource.extract_playlist_info(query, loop=bot.loop)
             
             if not entries:
+                player.is_loading_playlist = False
                 return await interaction.followup.send("❌ Playlist is empty or unavailable.", ephemeral=True)
             
             # Limitáljuk a lejátszási listát (pl. max 50 dal)
@@ -706,6 +723,16 @@ async def play(interaction: Interaction, query: str):
             skipped_reasons = {}
             
             for i, entry in enumerate(entries, 1):
+                # CHECK: Ha a stop flag be van állítva, állítsuk le a playlist betöltését
+                if player.stop_loading:
+                    logger.info(f"[Guild {interaction.guild_id}] Playlist loading stopped by user at {i}/{len(entries)}")
+                    await interaction.followup.send(
+                        f"⏹ Playlist loading stopped. Added **{added_count}** songs before stopping.",
+                        ephemeral=True
+                    )
+                    player.is_loading_playlist = False
+                    return
+                
                 try:
                     # Videó URL készítése a flat extraction eredményéből
                     video_url = entry.get("url") or entry.get("webpage_url")
@@ -767,6 +794,9 @@ async def play(interaction: Interaction, query: str):
                     skipped_reasons["Error"] = skipped_reasons.get("Error", 0) + 1
                     continue
             
+            # Reset loading flag
+            player.is_loading_playlist = False
+            
             # Részletes összefoglaló üzenet
             if added_count > 0:
                 summary = f"✅ Added **{added_count}** songs from playlist **{playlist_title}**"
@@ -786,6 +816,7 @@ async def play(interaction: Interaction, query: str):
                 await interaction.followup.send("❌ Could not add any songs from the playlist.", ephemeral=True)
                 
         except Exception as e:
+            player.is_loading_playlist = False
             logger.error(f"[Guild {interaction.guild_id}] Playlist error for '{query}': {e}")
             return await interaction.followup.send("❌ Could not load playlist.", ephemeral=True)
     
@@ -856,10 +887,22 @@ async def pause(interaction: Interaction):
 @tree.command(name="resume", description="Resume playback")
 async def resume(interaction: Interaction):
     vc = interaction.guild.voice_client
+    player = get_player(interaction.guild_id)
+    
     if vc and vc.is_paused():
         vc.resume()
         view = MusicControls(interaction.guild_id)
         await interaction.response.send_message("▶️ Resumed", view=view)
+    elif vc and not vc.is_playing() and len(player.queue) > 0:
+        # Special case: nothing playing but queue has songs
+        # This happens when user skips before next song loads
+        logger.info(f"[Guild {interaction.guild_id}] Resume triggered with empty current but non-empty queue")
+        await interaction.response.send_message("▶️ Starting playback from queue...", ephemeral=True)
+        await _play_next_for_guild(interaction.guild_id)
+    elif not vc:
+        await interaction.response.send_message("Bot is not connected to a voice channel.", ephemeral=True)
+    elif len(player.queue) == 0 and player.current is None:
+        await interaction.response.send_message("Nothing to resume. Queue is empty.", ephemeral=True)
     else:
         await interaction.response.send_message("Nothing to resume.", ephemeral=True)
 
@@ -899,7 +942,7 @@ async def show_queue(interaction: Interaction):
         for i, item in enumerate(player.queue, start=1):
             duration_str = format_time(item.duration) if item.duration else "Unknown"
             desc += f"`{i}.` {item.title} `[{duration_str}]`\n"
-            if len(desc) > 1800:
+            if len(desc) > 950:
                 desc += "... and more"
                 break
         embed.add_field(name="Up Next", value=desc, inline=False)
